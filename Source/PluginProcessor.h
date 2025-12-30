@@ -10,10 +10,17 @@
 
 #include <JuceHeader.h>
 
+//states for cut slopes: 12, 24, 36, and 48 DB
+enum Slope {
+    Slope_12,
+    Slope_24,
+    Slope_36,
+    Slope_48
+};
 
 class ChainSettings {
 public:
-    int highCutSlope{ 0 }, lowCutSlope{ 0 };
+    Slope highCutSlope{ Slope::Slope_12 }, lowCutSlope{ Slope::Slope_12 };
     float peakFreq{ 0 }, peakQuality{ 1.0 };
     float peakGainInDecibels{ 0 };
     float highCutFreq{ 0 }, lowCutFreq{ 0 };
