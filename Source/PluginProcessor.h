@@ -18,8 +18,7 @@ enum Slope {
     Slope_48
 };
 
-class ChainSettings {
-public:
+struct ChainSettings {
     Slope highCutSlope{ Slope::Slope_12 }, lowCutSlope{ Slope::Slope_12 };
     float peakFreq{ 0 }, peakQuality{ 1.0 };
     float peakGainInDecibels{ 0 };
@@ -38,6 +37,8 @@ public:
     //==============================================================================
     SimpleEQAudioProcessor();
     ~SimpleEQAudioProcessor() override;
+
+
 
     //==============================================================================
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
@@ -95,6 +96,45 @@ private:
         Peak,
         HighCut
     };
+
+    void updatePeakFilter(const ChainSettings& chainSettings);
+    void updateLowCutFilter(const ChainSettings& chainSettings);
+    void updateHighCutFilter(const ChainSettings& chainSettings);
+    void updateFilters();
+
+    using CutCoefficients = juce::ReferenceCountedArray<juce::dsp::IIR::Coefficients<float>>;
+
+    template <int Index, typename ChainType>
+    void applyCoefficient(ChainType& chain, const CutCoefficients& cutCoefficients) {
+        *chain.template get<Index>().coefficients = *cutCoefficients[Index];
+        chain.template setBypassed<Index>(false);
+    }
+
+    template <typename ChainType>
+    void updateCutFilter(ChainType& chain, const CutCoefficients& cutCoefficients, Slope slope) {
+        
+        chain.template setBypassed<0>(true);
+        chain.template setBypassed<1>(true);
+        chain.template setBypassed<2>(true);
+        chain.template setBypassed<3>(true);
+
+
+        switch (slope) {
+        case Slope_48:
+            applyCoefficient<3>(chain, cutCoefficients);
+            [[fallthrough]];
+        case Slope_36:
+            applyCoefficient<2>(chain, cutCoefficients);
+            [[fallthrough]];
+        case Slope_24:
+            applyCoefficient<1>(chain, cutCoefficients);
+            [[fallthrough]];
+        case Slope_12:
+            applyCoefficient<0>(chain, cutCoefficients);
+            break;
+
+        }
+    }
 
     //==============================================================================
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SimpleEQAudioProcessor)
