@@ -81,15 +81,18 @@ int SimpleEQAudioProcessor::getCurrentProgram()
 
 void SimpleEQAudioProcessor::setCurrentProgram (int index)
 {
+    juce::ignoreUnused(index);
 }
 
 const juce::String SimpleEQAudioProcessor::getProgramName (int index)
 {
+    juce::ignoreUnused(index);
     return {};
 }
 
 void SimpleEQAudioProcessor::changeProgramName (int index, const juce::String& newName)
 {
+    juce::ignoreUnused(index, newName);
 }
 
 //==============================================================================
@@ -148,6 +151,7 @@ bool SimpleEQAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts)
 void SimpleEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
 {
     juce::ScopedNoDenormals noDenormals;
+    juce::ignoreUnused(midiMessages);
     auto totalNumInputChannels  = getTotalNumInputChannels();
     auto totalNumOutputChannels = getTotalNumOutputChannels();
 
@@ -162,18 +166,18 @@ void SimpleEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
 
     updateFilters();
 
-    auto chainSettings = getChainSettings(apvts);
-  
     juce::dsp::AudioBlock<float> block(buffer);
 
     auto leftBlock = block.getSingleChannelBlock(0);
-    auto rightBlock = block.getSingleChannelBlock(1);
-
     juce::dsp::ProcessContextReplacing<float> leftContext(leftBlock);
-    juce::dsp::ProcessContextReplacing<float> rightContext(rightBlock);
-
     leftChain.process(leftContext);
-    rightChain.process(rightContext);
+
+    if (buffer.getNumChannels() > 1)
+    {
+        auto rightBlock = block.getSingleChannelBlock(1);
+        juce::dsp::ProcessContextReplacing<float> rightContext(rightBlock);
+        rightChain.process(rightContext);
+    }
 
 }
 
@@ -185,9 +189,9 @@ bool SimpleEQAudioProcessor::hasEditor() const
 
 juce::AudioProcessorEditor* SimpleEQAudioProcessor::createEditor()
 {
-    //return new SimpleEQAudioProcessorEditor (*this);
+    return new SimpleEQAudioProcessorEditor (*this);
 
-    return new juce::GenericAudioProcessorEditor(*this);
+    //return new juce::GenericAudioProcessorEditor(*this);
 }
 
 //==============================================================================
@@ -254,7 +258,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout SimpleEQAudioProcessor::crea
     for (int i = 0; i < 4; i++) {
         juce::String str;
         str << (12 + i * 12);
-        str << "db/Oct";
+        str << " dB/Oct";
         stringArray.add(str);
     }
 

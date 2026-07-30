@@ -1,9 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
 <JUCERPROJECT id="MmxEVa" name="SimpleEQ" projectType="audioplug" useAppConfig="0"
-              addUsingNamespaceToJuceHeader="0" jucerFormatVersion="1" cppLanguageStandard="20">
+              addUsingNamespaceToJuceHeader="0" jucerFormatVersion="1" cppLanguageStandard="20"
+              pluginVSTCategory="kPlugCategSynth">
   <MAINGROUP id="Wj36U2" name="SimpleEQ">
     <GROUP id="{0D03FFF1-781A-E27E-2EF7-A311647652C9}" name="Source">
+      <FILE id="oy66J4" name="EQCustomLook.h" compile="0" resource="0" file="Source/EQCustomLook.h"/>
       <FILE id="zhocMS" name="PluginProcessor.cpp" compile="1" resource="0"
             file="Source/PluginProcessor.cpp"/>
       <FILE id="x5jeNl" name="PluginProcessor.h" compile="0" resource="0"
