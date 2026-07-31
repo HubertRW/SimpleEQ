@@ -26,8 +26,10 @@ SimpleEQAudioProcessorEditor::SimpleEQAudioProcessorEditor(SimpleEQAudioProcesso
         addAndMakeVisible(comp);
     }
     addAndMakeVisible(ResponseCurve);
+
+    setResizable(true, true);
+    setResizeLimits(100, 100, 1500, 1500);
     setSize (1000, 600);
-    //setSize(500, 500);
 }
 
 SimpleEQAudioProcessorEditor::~SimpleEQAudioProcessorEditor()

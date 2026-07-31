@@ -108,7 +108,7 @@ private:
     ResponseCurveComponent ResponseCurve;
 
 
-    // LCF(low cut frequency), LCS(low cut slope
+    // LCF(low cut frequency), LCS(low cut slope)
     // HCF(high cut frequency), HCS(high cut slope)
     // PF(peak frequency), PG(peak gain), PQ(peak quality)
 
