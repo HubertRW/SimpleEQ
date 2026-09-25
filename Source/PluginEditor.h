@@ -13,6 +13,7 @@
 #include "EQCustomLook.h"
 
 
+
 //==============================================================================
 /**
 */
@@ -45,8 +46,8 @@ public:
 
         getLookAndFeel().drawRotarySlider(g, static_cast<int>(knobBounds.getX()), static_cast<int>(knobBounds.getY()), 
             static_cast<int>(knobBounds.getWidth()), static_cast<int>(knobBounds.getHeight()), position,
-            juce::MathConstants<float>::pi * 1.25f, //double-check later
-            juce::MathConstants<float>::pi * 2.75f, //double-check later
+            juce::MathConstants<float>::pi * 1.25f,
+            juce::MathConstants<float>::pi * 2.75f, 
             *this);
 
         
