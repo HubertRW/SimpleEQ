@@ -144,11 +144,13 @@ ResponseCurveComponent::ResponseCurveComponent(SimpleEQAudioProcessor& p) : audi
         param->addListener(this);
     }
 
+    timerCallback(); // Discard audio from before this editor was opened.
     startTimerHz(60);
 }
 
 ResponseCurveComponent::~ResponseCurveComponent()
 {
+    stopTimer();
     for (auto* param : audioProcessor.getParameters()) {
         param->removeListener(this);
     }
@@ -164,126 +166,245 @@ void ResponseCurveComponent::parameterGestureChanged(int, bool)
 {
 }
 
+juce::Rectangle<float> ResponseCurveComponent::getAnalysisBounds() const
+{
+    return { 42.0f, 24.0f, juce::jmax(0.0f, getWidth() - 86.0f),
+             juce::jmax(0.0f, getHeight() - 46.0f) };
+}
+
+bool ResponseCurveComponent::clearSpectra()
+{
+    bool changed = false;
+    for (size_t channel = 0; channel < spectrumProducers.size(); ++channel)
+    {
+        changed = changed || !spectrumProducers[channel].getPath().isEmpty();
+        spectrumProducers[channel].reset();
+        receivedSamples[channel] = false;
+    }
+    return changed;
+}
+
+bool ResponseCurveComponent::drainChannel(
+    int channel, const SimpleEQAudioProcessor::AnalyzerState& state, juce::uint32 now)
+{
+    const auto index = static_cast<size_t>(channel);
+    auto& producer = spectrumProducers[index];
+    bool changed = producer.setView(getAnalysisBounds(), state.sampleRate);
+    // A fixed sample budget prevents offline rendering from monopolising the GUI.
+    int remaining = juce::jmin(audioProcessor.getAvailableAnalyzerSamples(channel), 8192);
+    while (remaining > 0)
+    {
+        const auto read = audioProcessor.pullAnalyzerSamples(
+            channel, analyzerScratch, juce::jmin(remaining, 2048));
+        if (read.numSamples == 0)
+            break;
+        remaining -= read.numSamples;
+        if (read.generation != state.generation || read.sampleRate != state.sampleRate
+            || channel >= state.channels)
+            continue; // Stale audio is consumed but NEVER mapped at the new rate.
+        if (read.discontinuity)
+        {
+            producer.reset();
+            changed = true;
+        }
+        lastSampleTime[index] = now;
+        receivedSamples[index] = true;
+        if (producer.InitPath(analyzerScratch, 0))
+            changed = true;
+    }
+    // Clear frozen traces when the host stops calling processBlock.
+    if (receivedSamples[index] && now - lastSampleTime[index] > 500u)
+    {
+        producer.reset();
+        receivedSamples[index] = false;
+        changed = true;
+    }
+    return changed;
+}
+
 void ResponseCurveComponent::timerCallback()
 {
     if (parametersChanged.compareAndSetBool(0, 1))
+        responseDirty = true;
+
+    const auto state = audioProcessor.getAnalyzerState();
+    if (!state.stable)
     {
+        if (clearSpectra())
+            repaint();
+        return; // Preparation in progress. Never wait for the audio/lifecycle thread.
+    }
+
+    bool changed = false;
+    if (!haveAnalyzerState || displayedGeneration != state.generation)
+    {
+        clearSpectra();
+        // Consumer-side discard is safe while the producer continues writing.
+        audioProcessor.discardAnalyzerSamples();
+        displayedGeneration = state.generation;
+        haveAnalyzerState = true;
+        if (state.sampleRate > 0.0)
+            displaySampleRate = state.sampleRate;
+        responseDirty = true;
+        changed = true;
+    }
+
+    if (state.sampleRate > 0.0)
+    {
+        const auto now = juce::Time::getMillisecondCounter();
+        for (int channel = 0; channel < 2; ++channel)
+            if (drainChannel(channel, state, now))
+                changed = true;
+    }
+    else
+    {
+        if (clearSpectra())
+            changed = true;
+        audioProcessor.discardAnalyzerSamples();
+    }
+
+    // A prepare/release could have happened during the bounded drain.
+    const auto after = audioProcessor.getAnalyzerState();
+    if (!after.stable || after.generation != state.generation)
+    {
+        clearSpectra();
+        haveAnalyzerState = false;
+        changed = true;
+    }
+
+    if (responseDirty)
+    {
+        rebuildResponsePath();
+        changed = true;
+    }
+    if (changed)
         repaint();
+}
+
+void ResponseCurveComponent::resized()
+{
+    for (auto& producer : spectrumProducers)
+        producer.setView(getAnalysisBounds(), displaySampleRate);
+    responseDirty = true;
+    rebuildResponsePath();
+    repaint();
+}
+
+void ResponseCurveComponent::rebuildResponsePath()
+{
+    responsePath.clear();
+    responseDirty = false;
+    const auto bounds = getAnalysisBounds();
+    if (bounds.isEmpty() || displaySampleRate <= 40.0)
+        return;
+
+    const auto settings = getChainSettings(audioProcessor.apvts, displaySampleRate);
+    const auto peak = juce::dsp::IIR::Coefficients<float>::makePeakFilter(
+        displaySampleRate, settings.peakFreq, settings.peakQuality,
+        juce::Decibels::decibelsToGain(settings.peakGainInDecibels));
+    const auto low = juce::dsp::FilterDesign<float>::designIIRHighpassHighOrderButterworthMethod(
+        settings.lowCutFreq, displaySampleRate, 2 * (settings.lowCutSlope + 1));
+    const auto high = juce::dsp::FilterDesign<float>::designIIRLowpassHighOrderButterworthMethod(
+        settings.highCutFreq, displaySampleRate, 2 * (settings.highCutSlope + 1));
+
+    const int width = juce::jmax(1, static_cast<int>(std::ceil(bounds.getWidth())));
+    for (int pixel = 0; pixel <= width; ++pixel)
+    {
+        const float proportion = static_cast<float>(pixel) / width;
+        const double frequency = 20.0 * std::pow(1000.0, proportion);
+        if (frequency >= displaySampleRate * 0.5)
+            break;
+        double magnitude = peak->getMagnitudeForFrequency(frequency, displaySampleRate);
+        for (const auto& coefficients : low)
+            magnitude *= coefficients->getMagnitudeForFrequency(frequency, displaySampleRate);
+        for (const auto& coefficients : high)
+            magnitude *= coefficients->getMagnitudeForFrequency(frequency, displaySampleRate);
+        const auto db = juce::jlimit(-30.0f, 30.0f,
+            static_cast<float>(juce::Decibels::gainToDecibels(magnitude, -100.0)));
+        const float x = bounds.getX() + proportion * bounds.getWidth();
+        const float y = juce::jmap(db, -30.0f, 30.0f, bounds.getBottom(), bounds.getY());
+        if (pixel == 0)
+            responsePath.startNewSubPath(x, y);
+        else
+            responsePath.lineTo(x, y);
     }
 }
 
-
 void ResponseCurveComponent::paint(juce::Graphics& g)
 {
-    auto bounds = getLocalBounds().toFloat().reduced(1.f);
-    const int   w = static_cast<int>(bounds.getWidth());
-    const float sr = audioProcessor.getSampleRate() > 0.0
-        ? static_cast<float>(audioProcessor.getSampleRate())
-        : 44100.f;
-
-    // Panel background
+    const auto panelBounds = getLocalBounds().toFloat().reduced(1.0f);
     g.setColour(EQColours::panel);
-    g.fillRoundedRectangle(bounds, 4.f);
+    g.fillRoundedRectangle(panelBounds, 4.0f);
+    const auto bounds = getAnalysisBounds();
+    if (bounds.isEmpty())
+        return;
 
-    // Grid — vertical frequency lines
-    g.setColour(EQColours::responseGrid);
-    const float freqs[] = { 50, 100, 200, 500, 1000, 2000, 5000, 10000 };
-    const juce::String labels[] = { "50", "100", "200", "500", "1k", "2k", "5k", "10k" };
-    for (int i = 0; i < 8; ++i)
-    {
-        const float nx = std::log10(freqs[i] / 20.f) / std::log10(20000.f / 20.f);
-        const float px = bounds.getX() + nx * bounds.getWidth();
-        g.drawVerticalLine(static_cast<int>(px), bounds.getY(), bounds.getBottom());
-    }
-
-    // Grid — horizontal dB lines
-    const float dbs[] = { -24.f, -12.f, 0.f, 12.f, 24.f };
-    for (auto db : dbs)
-    {
-        const float py = juce::jmap(db, -30.f, 30.f, bounds.getBottom(), bounds.getY());
-        g.drawHorizontalLine(static_cast<int>(py), bounds.getX(), bounds.getRight());
-    }
-
-    // Frequency axis labels
-    g.setColour(EQColours::labelText.withAlpha(0.55f));
-    g.setFont(juce::Font(juce::FontOptions("Helvetica Neue", 8.f, juce::Font::plain)));
-    for (int i = 0; i < 8; ++i)
-    {
-        const float nx = std::log10(freqs[i] / 20.f) / std::log10(20000.f / 20.f);
-        const float px = bounds.getX() + nx * bounds.getWidth();
-        g.drawText(labels[i],
-            static_cast<int>(px) - 12,
-            static_cast<int>(bounds.getBottom()) - 14,
-            24, 12, juce::Justification::centred);
-    }
-
-    // dB axis labels (right edge)
-    const juce::String dbLabels[] = { "-24", "-12", "0", "+12", "+24" };
-    for (int i = 0; i < 5; ++i)
-    {
-        const float py = juce::jmap(dbs[i], -30.f, 30.f,
-            bounds.getBottom(), bounds.getY());
-        g.drawText(dbLabels[i],
-            static_cast<int>(bounds.getRight()) - 26,
-            static_cast<int>(py) - 6,
-            24, 12, juce::Justification::right);
-    }
-
-    // --- Magnitude response path ---
-    auto settings = getChainSettings(audioProcessor.apvts);
-
-    auto peakCoeffs = juce::dsp::IIR::Coefficients<float>::makePeakFilter(
-        sr, settings.peakFreq, settings.peakQuality,
-        juce::Decibels::decibelsToGain(settings.peakGainInDecibels));
-
-    auto lowCutCoeffsArray =
-        juce::dsp::FilterDesign<float>::designIIRHighpassHighOrderButterworthMethod(
-            settings.lowCutFreq, sr, 2 * (settings.lowCutSlope + 1));
-
-    auto highCutCoeffsArray =
-        juce::dsp::FilterDesign<float>::designIIRLowpassHighOrderButterworthMethod(
-            settings.highCutFreq, sr, 2 * (settings.highCutSlope + 1));
-
-    juce::Path curve;
-
-    for (int px = 0; px < w; ++px)
-    {
-        const float normX = static_cast<float>(px) / static_cast<float>(w);
-        const float freq = 20.f * std::pow(1000.f, normX);   // 20 Hz – 20 kHz log scale
-
-        double mag = 1.0;
-        mag *= peakCoeffs->getMagnitudeForFrequency(freq, sr);
-
-        for (int s = 0; s <= settings.lowCutSlope &&
-            s < static_cast<int>(lowCutCoeffsArray.size()); ++s)
-            mag *= lowCutCoeffsArray[s]->getMagnitudeForFrequency(freq, sr);
-
-        for (int s = 0; s <= settings.highCutSlope &&
-            s < static_cast<int>(highCutCoeffsArray.size()); ++s)
-            mag *= highCutCoeffsArray[s]->getMagnitudeForFrequency(freq, sr);
-
-        const float db = static_cast<float>(juce::Decibels::gainToDecibels(mag));
-        const float py = juce::jmap(db, -30.f, 30.f, bounds.getBottom(), bounds.getY());
-
-        if (px == 0) curve.startNewSubPath(bounds.getX(), py);
-        else         curve.lineTo(bounds.getX() + static_cast<float>(px), py);
-    }
-
-    // Filled area under curve
-    juce::Path fill = curve;
-    fill.lineTo(bounds.getRight(), bounds.getBottom());
-    fill.lineTo(bounds.getX(), bounds.getBottom());
-    fill.closeSubPath();
-    g.setColour(EQColours::responseFill);
-    g.fillPath(fill);
-
-    // Curve line with glow
-    g.setColour(EQColours::responseLine.withAlpha(0.3f));
-    g.strokePath(curve, juce::PathStrokeType(4.f, juce::PathStrokeType::curved));
+    g.setFont(juce::Font(juce::FontOptions(10.0f)));
+    g.setColour(EQColours::labelText);
+    g.drawText("POST-EQ  dBFS", 5, 3, 100, 16, juce::Justification::left);
+    g.setColour(EQColours::spectrumLeft);
+    g.drawText("L / MONO", 110, 3, 58, 16, juce::Justification::left);
+    g.setColour(EQColours::spectrumRight);
+    g.drawText("R", 177, 3, 18, 16, juce::Justification::left);
     g.setColour(EQColours::responseLine);
-    g.strokePath(curve, juce::PathStrokeType(1.5f, juce::PathStrokeType::curved));
+    g.drawText("EQ gain dB", getWidth() - 82, 3, 77, 16, juce::Justification::right);
 
-    // Border
+    const float frequencies[] = { 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000 };
+    const juce::String labels[] = { "20", "50", "100", "200", "500", "1k", "2k", "5k", "10k", "20k" };
+    for (int i = 0; i < 10; ++i)
+    {
+        const auto x = bounds.getX() + std::log10(frequencies[i] / 20.0f) / 3.0f * bounds.getWidth();
+        g.setColour(EQColours::responseGrid);
+        g.drawVerticalLine(static_cast<int>(x), bounds.getY(), bounds.getBottom());
+        g.setColour(EQColours::labelText.withAlpha(0.7f));
+        g.drawText(labels[i], static_cast<int>(x) - 14, static_cast<int>(bounds.getBottom()) + 3,
+                   28, 14, juce::Justification::centred);
+    }
+    for (int db = -100; db <= 0; db += 25)
+    {
+        const auto y = juce::jmap(static_cast<float>(db), -100.0f, 0.0f,
+                                 bounds.getBottom(), bounds.getY());
+        g.setColour(EQColours::responseGrid);
+        g.drawHorizontalLine(static_cast<int>(y), bounds.getX(), bounds.getRight());
+        g.setColour(EQColours::labelText.withAlpha(0.7f));
+        g.drawText(juce::String(db), 2, static_cast<int>(y) - 6, 34, 12,
+                   juce::Justification::right);
+    }
+    for (int db = -24; db <= 24; db += 12)
+    {
+        const auto y = juce::jmap(static_cast<float>(db), -30.0f, 30.0f,
+                                 bounds.getBottom(), bounds.getY());
+        g.setColour(EQColours::responseLine);
+        const auto label = (db > 0 ? "+" : "") + juce::String(db);
+        g.drawText(label, static_cast<int>(bounds.getRight()) + 4,
+                   static_cast<int>(y) - 6, 34, 12, juce::Justification::left);
+    }
+
+    {
+        juce::Graphics::ScopedSaveState saved(g);
+        g.reduceClipRegion(bounds.toNearestInt());
+        const juce::Colour colours[] = { EQColours::spectrumLeft, EQColours::spectrumRight };
+        for (size_t channel = 0; channel < spectrumProducers.size(); ++channel)
+        {
+            const auto& path = spectrumProducers[channel].getPath();
+            if (path.isEmpty())
+                continue;
+            auto fill = path;
+            const auto end = path.getCurrentPosition();
+            fill.lineTo(end.x, bounds.getBottom());
+            fill.lineTo(path.getBounds().getX(), bounds.getBottom());
+            fill.closeSubPath();
+            g.setColour(colours[channel].withAlpha(0.08f));
+            g.fillPath(fill);
+            g.setColour(colours[channel].withAlpha(0.85f));
+            g.strokePath(path, juce::PathStrokeType(1.2f));
+        }
+        // Cached EQ response sits above the measured spectrum, on its own dB axis.
+        g.setColour(EQColours::responseLine.withAlpha(0.25f));
+        g.strokePath(responsePath, juce::PathStrokeType(4.0f));
+        g.setColour(EQColours::responseLine);
+        g.strokePath(responsePath, juce::PathStrokeType(1.5f));
+    }
     g.setColour(EQColours::panelBorder);
-    g.drawRoundedRectangle(bounds, 4.f, 1.f);
+    g.drawRoundedRectangle(panelBounds, 4.0f, 1.0f);
 }

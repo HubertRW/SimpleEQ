@@ -31,6 +31,8 @@ namespace EQColours
     const juce::Colour responseGrid{ 0xff252530 };
     const juce::Colour responseLine{ 0xff4ea8a8 };
     const juce::Colour responseFill{ 0x224ea8a8 };
+    const juce::Colour spectrumLeft{ 0xff68c8f2 };
+    const juce::Colour spectrumRight{ 0xffdca05b };
 
 }
 

@@ -9,6 +9,7 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include <memory>
+#include "MonoChannelSampleFifo.h"
 
 //==============================================================================
 SimpleEQAudioProcessor::SimpleEQAudioProcessor()
@@ -98,6 +99,12 @@ void SimpleEQAudioProcessor::changeProgramName (int index, const juce::String& n
 //==============================================================================
 void SimpleEQAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
+    // Host lifecycle calls are serialized with processBlock, but not with the GUI.
+    // Publish an odd generation while changing format; never reset a live FIFO.
+    analyzerGeneration.fetch_add(1);
+    captureSampleRate = sampleRate;
+    expectedTransportSample.reset();
+    filtersInitialized = false;
     // Use this method as the place to do any pre-playback
     // initialisation that you need..
 
@@ -110,7 +117,16 @@ void SimpleEQAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
     leftChain.prepare(spec);
     rightChain.prepare(spec);
 
+    leftChain.reset();
+    rightChain.reset();
+    leftSampleFifo.markDiscontinuity();
+    rightSampleFifo.markDiscontinuity();
+
     updateFilters();
+
+    analyzerSampleRate.store(sampleRate);
+    analyzerChannels.store(getTotalNumOutputChannels());
+    captureGeneration = analyzerGeneration.fetch_add(1) + 1;
 
 }
 
@@ -119,6 +135,12 @@ void SimpleEQAudioProcessor::releaseResources()
 {
     // When playback stops, you can use this as an opportunity to free up any
     // spare memory, etc.
+    analyzerGeneration.fetch_add(1);
+    captureSampleRate = 0.0;
+    expectedTransportSample.reset();
+    analyzerSampleRate.store(0.0);
+    analyzerChannels.store(0);
+    captureGeneration = analyzerGeneration.fetch_add(1) + 1;
 
 }
 
@@ -164,6 +186,10 @@ void SimpleEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
     for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
         buffer.clear (i, 0, buffer.getNumSamples());
 
+    if (buffer.getNumChannels() == 0 || buffer.getNumSamples() == 0
+        || captureSampleRate <= 0.0)
+        return;
+
     updateFilters();
 
     juce::dsp::AudioBlock<float> block(buffer);
@@ -179,6 +205,87 @@ void SimpleEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
         rightChain.process(rightContext);
     }
 
+    captureAnalyzerSamples(buffer);
+}
+
+void SimpleEQAudioProcessor::processBlockBypassed(juce::AudioBuffer<float>& buffer,
+                                                juce::MidiBuffer& midi)
+{
+    juce::ignoreUnused(midi);
+    if (buffer.getNumChannels() > 0 && buffer.getNumSamples() > 0 && captureSampleRate > 0.0)
+        captureAnalyzerSamples(buffer);
+}
+
+void SimpleEQAudioProcessor::captureAnalyzerSamples(const juce::AudioBuffer<float>& buffer)
+{
+    // Mark starts/seeks/loops without touching the consumer's indices.
+    if (auto* hostPlayHead = getPlayHead())
+    {
+        if (const auto position = hostPlayHead->getPosition())
+        {
+            if (const auto sample = position->getTimeInSamples();
+                sample && position->getIsPlaying())
+            {
+                if (!expectedTransportSample || *sample != *expectedTransportSample)
+                {
+                    leftSampleFifo.markDiscontinuity();
+                    rightSampleFifo.markDiscontinuity();
+                }
+                expectedTransportSample = *sample + buffer.getNumSamples();
+            }
+            else
+            {
+                if (expectedTransportSample)
+                {
+                    leftSampleFifo.markDiscontinuity();
+                    rightSampleFifo.markDiscontinuity();
+                }
+                expectedTransportSample.reset();
+            }
+        }
+        else
+            expectedTransportSample.reset();
+    }
+    else
+        expectedTransportSample.reset();
+
+    // Analyzer-only copies AFTER filtering. Full queues drop visualization data.
+    leftSampleFifo.push(buffer, captureSampleRate, captureGeneration);
+    rightSampleFifo.push(buffer, captureSampleRate, captureGeneration);
+}
+
+SimpleEQAudioProcessor::AnalyzerState SimpleEQAudioProcessor::getAnalyzerState() const noexcept
+{
+    const auto before = analyzerGeneration.load();
+    if ((before & 1u) != 0)
+        return {};
+    const auto rate = analyzerSampleRate.load();
+    const auto channels = analyzerChannels.load();
+    const auto after = analyzerGeneration.load();
+    return { rate, after, channels, before == after };
+}
+
+MonoChannelSampleFifo::ReadResult SimpleEQAudioProcessor::pullAnalyzerSamples(
+    int channel, juce::AudioBuffer<float>& destination, int maxSamples)
+{
+    if (channel == 0)
+        return leftSampleFifo.pull(destination, maxSamples);
+    if (channel == 1)
+        return rightSampleFifo.pull(destination, maxSamples);
+    destination.setSize(1, 0);
+    return {};
+}
+
+int SimpleEQAudioProcessor::getAvailableAnalyzerSamples(int channel) const noexcept
+{
+    return channel == 0 ? leftSampleFifo.getNumAvailableSamples()
+         : channel == 1 ? rightSampleFifo.getNumAvailableSamples() : 0;
+}
+
+void SimpleEQAudioProcessor::discardAnalyzerSamples() noexcept
+{
+    leftSampleFifo.discardPending();
+    rightSampleFifo.discardPending();
 }
 
 //==============================================================================
@@ -216,7 +323,7 @@ void SimpleEQAudioProcessor::setStateInformation (const void* data, int sizeInBy
     }
 }
 
-ChainSettings getChainSettings(juce::AudioProcessorValueTreeState& apvts)
+ChainSettings getChainSettings(juce::AudioProcessorValueTreeState& apvts, double sampleRate)
 {
     ChainSettings Settings;
 
@@ -228,6 +335,13 @@ ChainSettings getChainSettings(juce::AudioProcessorValueTreeState& apvts)
     Settings.lowCutSlope = static_cast<Slope>(apvts.getRawParameterValue("LowCut Slope")->load());
     Settings.highCutSlope = static_cast<Slope>(apvts.getRawParameterValue("HighCut Slope")->load());
 
+    if (sampleRate > 0.0)
+    {
+        const auto maximum = static_cast<float>(sampleRate * 0.499);
+        Settings.lowCutFreq = juce::jmin(Settings.lowCutFreq, maximum);
+        Settings.highCutFreq = juce::jmin(Settings.highCutFreq, maximum);
+        Settings.peakFreq = juce::jmin(Settings.peakFreq, maximum);
+    }
     return Settings;
 }
 
@@ -308,11 +422,24 @@ void SimpleEQAudioProcessor::updateHighCutFilter(const ChainSettings& chainSetti
 
 void SimpleEQAudioProcessor::updateFilters()
 {
-    auto chainSettings = getChainSettings(apvts);
+    auto chainSettings = getChainSettings(apvts, captureSampleRate);
+
+    // Do not allocate new coefficient designs every unchanged audio block.
+    if (filtersInitialized
+        && chainSettings.lowCutFreq == previousSettings.lowCutFreq
+        && chainSettings.highCutFreq == previousSettings.highCutFreq
+        && chainSettings.peakFreq == previousSettings.peakFreq
+        && chainSettings.peakGainInDecibels == previousSettings.peakGainInDecibels
+        && chainSettings.peakQuality == previousSettings.peakQuality
+        && chainSettings.lowCutSlope == previousSettings.lowCutSlope
+        && chainSettings.highCutSlope == previousSettings.highCutSlope)
+        return;
 
     updatePeakFilter(chainSettings);
     updateLowCutFilter(chainSettings);
     updateHighCutFilter(chainSettings);
+    previousSettings = chainSettings;
+    filtersInitialized = true;
 }
 
 //==============================================================================
