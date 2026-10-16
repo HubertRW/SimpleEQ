@@ -11,6 +11,9 @@
 #include <JuceHeader.h>
 #include "PluginProcessor.h"
 #include "EQCustomLook.h"
+#include "PathProducer.h"
+#include <array>
+
 
 
 //==============================================================================
@@ -45,8 +48,8 @@ public:
 
         getLookAndFeel().drawRotarySlider(g, static_cast<int>(knobBounds.getX()), static_cast<int>(knobBounds.getY()), 
             static_cast<int>(knobBounds.getWidth()), static_cast<int>(knobBounds.getHeight()), position,
-            juce::MathConstants<float>::pi * 1.25f, //double-check later
-            juce::MathConstants<float>::pi * 2.75f, //double-check later
+            juce::MathConstants<float>::pi * 1.25f,
+            juce::MathConstants<float>::pi * 2.75f, 
             *this);
 
         
@@ -74,8 +77,23 @@ class ResponseCurveComponent : public juce::Component, public juce::Timer,
     public juce::AudioProcessorParameter::Listener
 {
 private:
-    juce::Atomic<int> parametersChanged = 0;
+    juce::Atomic<int> parametersChanged = 1;
     SimpleEQAudioProcessor& audioProcessor;
+    std::array<PathProducer, 2> spectrumProducers;
+    juce::AudioBuffer<float> analyzerScratch { 1, 2048 };
+    juce::Path responsePath;
+    std::array<juce::uint32, 2> lastSampleTime {};
+    std::array<bool, 2> receivedSamples {};
+    std::uint64_t displayedGeneration = 0;
+    double displaySampleRate = 44100.0;
+    bool haveAnalyzerState = false;
+    bool responseDirty = true;
+
+    juce::Rectangle<float> getAnalysisBounds() const;
+    void rebuildResponsePath();
+    bool clearSpectra();
+    bool drainChannel(int channel, const SimpleEQAudioProcessor::AnalyzerState& state,
+                      juce::uint32 now);
 
 public:
     explicit ResponseCurveComponent( SimpleEQAudioProcessor& p);
@@ -85,6 +103,14 @@ public:
     void parameterGestureChanged(int, bool) override;
     void timerCallback() override;
     void paint(juce::Graphics& g) override;
+    void resized() override;
+
+    // Read-only geometry, owned and accessed on the message thread.
+    const juce::Path& getSpectrumPath(int channel) const
+    {
+        jassert(channel == 0 || channel == 1);
+        return spectrumProducers[static_cast<size_t>(juce::jlimit(0, 1, channel))].getPath();
+    }
 };
 
 

@@ -9,6 +9,8 @@
 #pragma once
 
 #include <JuceHeader.h>
+#include "MonoChannelSampleFifo.h"
+#include <atomic>
 
 //states for cut slopes: 12, 24, 36, and 48 DB
 enum Slope {
@@ -25,7 +27,8 @@ struct ChainSettings {
     float highCutFreq{ 0 }, lowCutFreq{ 0 };
 };
 
-ChainSettings getChainSettings(juce::AudioProcessorValueTreeState& apvts);
+ChainSettings getChainSettings(juce::AudioProcessorValueTreeState& apvts,
+                               double sampleRate = 0.0);
 
 
 //==============================================================================
@@ -49,6 +52,7 @@ public:
    #endif
 
     void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
+    void processBlockBypassed(juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
 
     //==============================================================================
     juce::AudioProcessorEditor* createEditor() override;
@@ -75,10 +79,38 @@ public:
 
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
+    struct AnalyzerState
+    {
+        double sampleRate = 0.0;
+        std::uint64_t generation = 0;
+        int channels = 0;
+        bool stable = false;
+    };
+
+    // Message-thread consumer API. Only one editor may drain these queues.
+    AnalyzerState getAnalyzerState() const noexcept;
+    MonoChannelSampleFifo::ReadResult pullAnalyzerSamples(
+        int channel, juce::AudioBuffer<float>& destination, int maxSamples);
+    int getAvailableAnalyzerSamples(int channel) const noexcept;
+    void discardAnalyzerSamples() noexcept;
+
     juce::AudioProcessorValueTreeState apvts {*this, nullptr, "Parameter", createParameterLayout()};
 
 private:
     
+    // Never reset/resize these concurrently. Epoch tags reject old queued audio.
+    MonoChannelSampleFifo leftSampleFifo { 0, 16384 };
+    MonoChannelSampleFifo rightSampleFifo { 1, 16384 };
+    std::atomic<std::uint64_t> analyzerGeneration { 0 };
+    std::atomic<double> analyzerSampleRate { 0.0 };
+    std::atomic<int> analyzerChannels { 0 };
+    double captureSampleRate = 0.0; // Producer/lifecycle thread only.
+    std::uint64_t captureGeneration = 0;
+    juce::Optional<juce::int64> expectedTransportSample;
+    ChainSettings previousSettings;
+    bool filtersInitialized = false;
+    void captureAnalyzerSamples(const juce::AudioBuffer<float>& buffer);
+
     using Filter = juce::dsp::IIR::Filter<float>;
     using Gain = juce::dsp::Gain<float>;
 

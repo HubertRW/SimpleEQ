@@ -31,6 +31,8 @@ namespace EQColours
     const juce::Colour responseGrid{ 0xff252530 };
     const juce::Colour responseLine{ 0xff4ea8a8 };
     const juce::Colour responseFill{ 0x224ea8a8 };
+    const juce::Colour spectrumLeft{ 0xff68c8f2 };
+    const juce::Colour spectrumRight{ 0xffdca05b };
 
 }
 
@@ -57,8 +59,7 @@ public:
         const float yCenter = static_cast<float>(y) + static_cast<float>(height) * 0.5f;
         const float radius = juce::jmin<float>(static_cast<float>(width) / 2.f,
                                               static_cast<float>(height) / 2.f) - 6.f;
-        /*const float xRadius = xCenter - radius;
-        const float yRadius = xCenter - radius;*/
+        
         const float trackWidth = radius * 0.12f;
         const float capR = radius - trackWidth - 3.0f;
         
